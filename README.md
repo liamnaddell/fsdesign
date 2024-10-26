@@ -1,15 +1,23 @@
 # Design
 
+## Q/A:
+
+How does this design implement a speedy `find` command:
+1. We bulk transfer directory entries between libc, procnto, and the file system driver to minimize syscalls
+2. All opens are openat's, so each 1000 entry directory need only be searched once.
+    1. `find` will perform a brute force search of the directory entries once it has opened the directory
+    2. Opening directories requires a filesystem to do a brute force search of the tree it is attempting to open. If each directory contains 1000 entries, a mere 5-level-deep tree would require each open to search 1000^5 entries, which is completely unacceptable. By designing `open` to be converted to an `openat(CWD,rel_path)`, we allow a properly implemented `find` to linearly search the entire tree.
+3. The filesystem itself is based off of a design similar to the `ext2/3` filesystem series. This design is likely sufficient to implement a speedy `readdir`, as it's main performance impact is a slightly longer read time vs an extent+b-tree based design like xfs, btrfs, or ext4. Slightly longer here meaning 5-10 extra block reads from disk, assuming no caching.
+
 ## TODO
 
-* Count avg directory entries
-* count average filename length
-* what devices are we targeting?
-* Union filesystems
 * Pretty pictures!
 * https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.getting_started/topic/s1_resmgr_Finding_server.html
 * File systems as shared libraries
 * Thomasf https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.sys_arch/topic/resource_FILESYSresmgr.html
+* Caching
+* Synchronization.
+* Handle deleting dir entries
 
 ## Understanding the task
 
@@ -24,7 +32,9 @@
 
 ...
 int find(const char *filename, const char *dirname) {
-    DIR *d = opendir(dirname);
+    //chdir is acting as a simplified version of "openat"
+    chdir(dirname);
+    DIR *d = opendir(".");
     //NOTE: Ignoring error handling
     struct dirent *de = readdir(d);
     while (de != NULL) {
@@ -47,7 +57,7 @@ int find(const char *filename, const char *dirname) {
 
 1. We implemented DFS here, but others might implement BFS search, it's allegedly faster.
 2. Strcmp is probably not that expensive for O(~10-50) average case elements.
-3. What's `de`'s lifetime? The manual doesn't say!
+3. What's `de`'s lifetime? The manual doesn't say! I assume de lives until the next readdir from within the same thread.
 
 ## How might we implement this in libc?
 
@@ -57,19 +67,17 @@ One nice note of our "find" implementation is that we do NOT have to call `stat`
 
 ```c
 
-struct dirent {
+//NOTE: The directory entry structure is defined by procnto. This is because we need each filesystem to report directory entry data in the exact same format, regardless of the underlying differences.
+struct procnto_dirent {
     char d_type;
-    /* good idea, shamelessly stolen from glibc */
-    unsigned short d_reclen;
-    /* name */
-    const char *d_name;
+    unsigned short d_reclen; /* good idea from glibc! */
+    const char *d_name; /* name */
 };
 
 #define BSIZE 512
 typedef struct DIR {
     int fd;
     //buf for readdir
-    //DESIGN NOTE: I did this to make readdir (correct word: reentrant?)
     char rd_buf[BSIZE];
     //dir entry for readdir to return pointers to.
     struct dirent de;
@@ -123,6 +131,8 @@ struct dirent *readdir(DIR *dirp) {
 struct file {
     unsigned char type;
     //... Open might as well also call stat() while we are at it...
+    //Once the "stat" is read, we discard the cached stat results.
+    //So if the user calls stat again, they will be supplied with fresh data
     //Token for VFS.
     int global_file_id;
 };
@@ -134,8 +144,10 @@ int open(const char *pathname, int flags) {
     coid = ConnectAttach (0, VFS_PROCESS, VFS_CHANNEL, 0, 0);
 
     struct file f;
-
-    int retval = MsgSend(coid,"Please open and stat {pathname} for me",msg_len,&f,sizeof(struct file));
+    //we store CWD as a "struct DIR *"
+    int dir_id = libc_get_cwd()->global_fd;
+    //This is basically an openat + stat.
+    int retval = MsgSend(coid,"Please open and stat {pathname} for me, I am at directory {dir_id}",msg_len,&f,sizeof(struct file));
     //handle error;
 
     int fd = libc_add_file(&f);
@@ -151,12 +163,13 @@ ssize_t read(int fd, void *buf, size_t count) {
     //   etc by specifying message type
     long a = MsgSend(fi->coid,"Please get file data" + fi->global_file_id,msg_len,buf,count);
 
-    //TODO: ???
     return a;
 }
 ```
 
 In summary, readdir() is a wrapper around read(), which bulk receives directory entries from VFS. We improve efficiency by handling all the information in large chunks, and having the readdir() function only make syscalls when absolutely necessary.
+
+We also cache stat calls, assuming that `find` will really want this information in case of a more complex search.
 
 ##What happens at the VFS layer?
 
@@ -168,7 +181,10 @@ Where does the VFS live in the system? A: I believe it is in procnto aka /sbin/i
 
 As such, we need a mechanism for registering mounts.
 
+TODO: Sometimes superblocks are at weird locations
 When a user mounts a filesystem, we need to determine which filesystem driver is appropriate. The superblock should (e.g. will) make this clear.
+
+NOTE: I wrote this design before looking up the QNX documentation, and seeing how QNX actually implemented this. I think my guesses for how VFS works were pretty good, but the process of registering drivers and sending superblocks diverged significantly from how QNX seems to have implemented this.
 
 ```c
 //File system driver makes itself known to procnto:
@@ -208,12 +224,24 @@ int handle_mount_request(device d, const char *loc) {
     }
 }
 
-//Handle incoming open()'s Assuming this is a message sent to us by someone's libc.
-int handle_open(const char *full_path) {
+//Handle incoming openat+stat()'s Assuming this is a message sent to us by someone's libc.
+int handle_openstatat(int starting_directory_id, const char *relative_path) {
     struct open_query_reply r;
+    //Remove ".." and "." and "//"
+    struct procnto_dir *d = procnto_get_file(starting_directory_id);
+    if (d == NULL || !d->type == TYPE_DIR) {
+        return -1;
+    }
+
+    const char *simplified_path = remove_relative(relative_path);
     for (auto mount : mounttable.get_mounts()) {
-        if (mount.path() prefixes full_path) {
-            long a = MsgSend(mount.coid,"Open file {full_path - mount.path()}",n,&r,sizeof(open_query_reply));
+        //we know which filesystem d resides on, and where "d" is in the VFS.
+        //However, relative path could be for a mount that starts under d.
+        if (mount.path() prefixes d->path + relative_path) {
+            //This is a unioned filesystem implementation, which prioritizes files close to the root in case of name conflicts.
+            //It might be better to prioritize lowest mounted filesystem first.
+            //Again, we are effectively sending an openat + stat.
+            long a = MsgSend(mount.coid,"Open and stat file {full_path - mount.path()} starting at {d->local_id}",n,&r,sizeof(open_query_reply));
 
             if (r.success) {
                 return r.file_id;
@@ -230,6 +258,7 @@ ssize_t handle_read(int global_file_id, void *buf, size_t size) {
     //local_file_id's are assigned by the filesystem.
     //procnto maintains a mapping from global_file_id -> local_file_id
     struct qnx_file *f = procnto_get_file(global_file_id);
+    //TODO: I'm not distinguishing here between "read" and "read_at". It's likely we want read() to only exist within libc, and read_at() to exist everywhere else.
     long a = MsgSend(f->driver->coid,"Please get this file data "+local_file_id,buf,size);
     return a;
 }
@@ -241,13 +270,110 @@ ssize_t handle_read(int global_file_id, void *buf, size_t size) {
 * To reiterate, a filesystem ResMgr manages a block device.
 
 Q: How do FS drivers assert EXCLUSIVE access to a block device.
+A: They link to io-blk which is the only present driver on the system!
 
+Ok, so we have 2 ideas: An extent based design, or an indexed based design.
+
+Pros of extents:
+* More space efficient in the inode, more contiguous => more speed.
+* SATA seems to allow you to request multiple contiguous blocks, so filesystems which allocate contiguously are likely to have high performance.
+* Expensive to track. Btrfs, xfs, and ext4 all use b-trees to track extents, which is probably too difficult of a design to implement here.
+
+Pros of indexed files:
+* More simple to implement
+* Even small block size (512B) is likely to store >100 directory entries. So one inode with ~10-13 direct pointers is likely to store at least 1000 as wanted.
+* No fragmentation.
+
+NOTE: This code is adapted from my previous group project, PINTOS.
+* Our original design did not have an inode table, however, I have added one for more realism.
+* Code also used to contain sparse inodes to balence this strange design, these were removed, as inodes are no longer block sized.
+* Sparse inodes are a nightmare to program for.
+* Our original design had very easy support for openat(), since the filesystem could just grab the current user's CWD, then base relative queries from there. Microkernel cannot do this as easily because the relevant data lies across the process boundary.
 
 ```c
+struct superblock {
+  // 0xdeadbeef
+  uint32_t magic;
+  // location of free map on disk
+  block_sector_t bitmap;
+  // length of the bitmap in bytes.
+  uint32_t bitmap_size;
+  // location of / on disk.
+  block_sector_t root;
+  // The amount of inodes
+  uint32_t num_inodes;
+  // Location of inode table on disk.
+  //  Inode table is a giant list of inodes.
+  block_sector_t itable;
+  //Used for finding "/"
+  inum_t root_inode_num;
+  uint8_t block_size;
+};
+
+#define I_FILETYPE (1 << 0)
+#define I_FILE 0
+#define I_DIR (1 << 0)
+#define I_ALIVE (1 << 1)
+struct inode_disk
+{
+    //Length in "number of blocks"
+    uint32_t num_blocks;
+    //TODO: Why do you need back pointers?
+    block_sector_t parent; /* Our directory parent inode */
+    block_sector_t directs[16];
+    block_sector_t indirect; /* Single-level indirect */
+    block_sector_t d_indirect; /* double-level indirect */
+    block_sector_t t_indirect; /* triple-level indirect */
+    inum_t inum; /* used for responding to fstat queries */
+
+    //File length = num_blocks * BLOCK_SIZE + rem_size
+    uint8_t rem_size;
+    uint8_t type;
+    //inode size is 128B, so we can fit 4 into a block.
+    char wasted_space[42];
+};
+
+//NOTE: This is an in-memory format
+struct dir_entry
+{
+    //inode sector is zero if dir_entry is not in use
+    block_sector_t inode_sector; /* Sector number of header. */
+    //dir entry file names are stored as packed as possible on disk
+    //name is null terminated, and cannot be greater than MAX_NAME_LEN
+    //max_name_len is set so that dir_entry is smaller than a block.
+    char name[];
+};
+
 //These read and open requests come from some passed message from procnto.
-int handle_open(const char *full_path) {
-    
+//NULL indicates "/".
+struct openstatat_response handle_openstatat(struct dir *at, const char *path) {
+    char *splits = path_split(full_path);
+    //From "at", we can recursively descend, each segment of "path" until we reach the base
+    //NOTE: Path does not contain ".." because procnto strips these by necessity.
+    //Once we find + open the file, we can easily stat by reading the inode fields.
+    //We return this data as a response struct.
 }
-ssize_t handle_read(int global_file_id, void *buf, size_t size) {
+
+//"Local file ID" => "inum"
+//We will send this data back as a message to procnto.
+//TODO: Make procnto match this.
+ssize_t handle_read(int inum, size_t pos, void *buf, size_t size) {
+    struct file *f = NULL;
+    struct dir *d = NULL;
+    size_t s = 0;
+    fs_try_open(inum,f,d);
+    if (f != NULL) {
+        return inode_read_at(f->inode,pos,buf,size);
+    } else if (d != NULL) {
+        /*
+         * NOTE: we MUST give directory entries to procnto in a format PROCNTO
+         *  can understand. Not our own internal format.
+         *
+         * If pos does not point to the beginning of a dir entry, this will fail.
+         * Each dir entry returned is valid.
+         */
+        return inode_read_direntries(f->inode,pos,buf,size);
+    }
+    return -1;
 }
 ```
