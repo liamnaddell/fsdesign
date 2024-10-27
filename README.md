@@ -387,8 +387,49 @@ ssize_t handle_read(int inum, size_t pos, void *buf, size_t size) {
     }
     return -1;
 }
+NOTE: I did not include inode reading/writing code, since its not super complex, but it is very tedious. Essentially, for reading you can divide the read start location by the block size, to figure out which block to read from, then pointer-chase if needed to perform the read. For writing, you can apply the same process. What's unfortunate is that you need to handle each kind of indirection differently, which balloons the code size. Our project was even worse because of sparse inodes.
 ```
+
+## Caching and Synchronization.
+
+We can break synchronization down into two challenges, "inode data synchronization" and "File system synchronization".
+
+## Inode data synchronization
+
+### Files
+
+Judging from what I have read online, the main synchronization requirement for UNIX is that almost every FS operation has to be atomic. On files, we can enforcing block-sized write restrictions, and only allowing one writer for each region at a time. The only caveat is when multiple users try to extend a file at the same time. We only allow one person to extend a file at once.
+
+### Directories
+
+Directories are much more tricky to handle, since these inodes contain FS-internal data. Depending on how exactly you lay out directory entries, you can have cascading writes. In the case of a tree structure, you need to have locks for each node, which could be more efficient. It's possible that the best solution would be to only let one user unlink / link directory entries at once. The reason directories are more complex is that you do not know *where* you are going to need to write to in advance. So an unlink() is effecively a scan + remove, while a link (create or hard link) is a "find the next empty slot, and put something in it".
+
+NOTE: unlink() does not delete file data, only the directory entry. File data is garbage collected on file closure by all who have the file open.
+
+## File System synchronization.
+
+The challenge of FS synchronization is keeping the entire directory tree stable, including at the VFS layer.
+* We can have people moving files or directories around while another user has them open. This is actually safe when working with file descriptors, but once paths are introduced, the challenge becomes unsolvable.
+* Procnto/VFS needs to use paths when resolving where a file lies with respect to the filesystem boundary. This could introduce issues if not handled properly.
+* Security: Time-of-check-time-of-use has been difficult to solve on unix. I think windows solved toctou by locking entire FS trees for exclusive access. This would have to be handled as a unix extension.
 
 ## Caching
 
-TODO:
+Caching is an area of FS design I feel less comfortable with, however, the design I would choose for caching would be that the cache sits as a layer between block read/write requests, and the filesystem itself. 
+* The cache acts as a hash map from block pointers to block data.
+* I would guess that you only want to cache in units of 4096 (page size) for convenience and alignment when allocating.
+* If the FS only wants 512 bytes, you load 4096 bytes into memory. Ex, a read request for block 0 would also load the data for blocks 1,2, and 3. 
+* For low time complexity, you need the cache to act as a hash map. For cache replacement, you need a separate data structure.
+    * I would implement this by maintaining a list of cache entries. At this point, you can pick a standard replacement algorithm such as Clock, LRU, etc to handle eviction.
+* Evicition writes the block to disk.
+* Major design tradeoff: How often do you evict to disk (without intervention)?
+    * You can write ALL filesystem data to disk as soon as possible. Pro: Less likely to lose data, Con: Not able to buffer writes as well.
+    * You can periodically flush writes from cache to disk. This is more efficient, but might lose data.
+    * You can wait for eviction. I'm more suspicious of this design. I would worry that entries could remain in the cache for a long time because of reads, which would result in data loss.
+* All filesystem data (data that lies OUTSIDE the inode) must be written immediately. All filesystems rely on atomic block-level writes to ensure consistency.
+* flush must work correctly.
+* You need to prevent the cache from being swapped to disk.
+
+### Personal interest question:
+
+Disks also have caching now. I'm quite curious what happens when you have nested caching systems. Do nested caches constructively interfere? destructively interfere? I know CPU's have multilevel caches, and when data gets evicted from L1 cache, it moves to L2 cache, etc. With a disk, the disk has no idea what caching system the FS is using, and vice-versa. I wonder if there's a lot of cache flushes for blocks which are NEVER! going to be read/written to again, that cause cache thrashing at the disk level.
