@@ -78,6 +78,8 @@ struct procnto_dirent {
 typedef struct DIR {
     int fd;
     //buf for readdir
+    //NOTE: we could also mallocate this when reading the 
+    // first dir entry, and de-allocate on the last one
     char rd_buf[BSIZE];
     //dir entry for readdir to return pointers to.
     struct dirent de;
@@ -137,10 +139,9 @@ struct file {
     int global_file_id;
 };
 
-//TODO:
 int open(const char *pathname, int flags) {
     //reserved,pid,chid,index,flags
-    //TODO: How do you know pid, channel? Do we just ask procnto?
+    //VFS_PROCESS = procnto
     coid = ConnectAttach (0, VFS_PROCESS, VFS_CHANNEL, 0, 0);
 
     struct file f;
@@ -159,9 +160,7 @@ ssize_t read(int fd, void *buf, size_t count) {
     struct file *fi = libc_get_file(fd);
     //...error handling...
 
-    //NOTE: A real message would have message data. I'd imagine we'd want to handle stat,
-    //   etc by specifying message type
-    long a = MsgSend(fi->coid,"Please get file data" + fi->global_file_id,msg_len,buf,count);
+    long a = MsgSend(fi->coid,"Please get file data: {fi->global_file_id}, starting at {fi->loc}",msg_len,buf,count);
 
     return a;
 }
@@ -169,19 +168,18 @@ ssize_t read(int fd, void *buf, size_t count) {
 
 In summary, readdir() is a wrapper around read(), which bulk receives directory entries from VFS. We improve efficiency by handling all the information in large chunks, and having the readdir() function only make syscalls when absolutely necessary.
 
-We also cache stat calls, assuming that `find` will really want this information in case of a more complex search.
+We also cache stat calls, assuming that `find` will likely want this information in case of a more complex search.
 
-##What happens at the VFS layer?
+## What happens at the VFS layer?
 
 The VFS operates by dispatching FS messages to the appropriate drivers. In our case, we need to take read requests (on files and directories), and forward them, knowing also that QNX operates using unioned filesystems.
 
 How might a VFS work? Well the inputs to a VFS are a set of mounts and mount points, and the VFS will use this information to dispatch reads/writes.
 
-Where does the VFS live in the system? A: I believe it is in procnto aka /sbin/init.
+Q: Where does the VFS live in the system? A: I believe it is in procnto aka /sbin/init.
 
 As such, we need a mechanism for registering mounts.
 
-TODO: Sometimes superblocks are at weird locations
 When a user mounts a filesystem, we need to determine which filesystem driver is appropriate. The superblock should (e.g. will) make this clear.
 
 NOTE: I wrote this design before looking up the QNX documentation, and seeing how QNX actually implemented this. I think my guesses for how VFS works were pretty good, but the process of registering drivers and sending superblocks diverged significantly from how QNX seems to have implemented this.
@@ -193,7 +191,9 @@ int register_driver() {
     long a = MsgSend(coid_with_procnto,"I am a filesystem driver",msg_len,NULL,0);
     return a;
 }
+```
 
+```c
 //Procnto creates a list of filesystems:
 int handle_new_filesystem() {
     while (true) {
@@ -222,17 +222,22 @@ int handle_mount_request(device d, const char *loc) {
         }
         //Reply is "Not Mine"
     }
+    printf("If this device contains a filesystem, no installed filesystem drivers recognize it\n");
+    return -1;
 }
 
 //Handle incoming openat+stat()'s Assuming this is a message sent to us by someone's libc.
 int handle_openstatat(int starting_directory_id, const char *relative_path) {
     struct open_query_reply r;
-    //Remove ".." and "." and "//"
     struct procnto_dir *d = procnto_get_file(starting_directory_id);
     if (d == NULL || !d->type == TYPE_DIR) {
         return -1;
     }
 
+    //Remove ".." and "." and "//"
+    //NOTE: We have to be careful to handle openat(".","..") properly. In this case, it is non-trivial to remove "..".
+    // We do know that procnto has to handle this, since ".." might lie across the FS boundary, so by the time these paths make it to the fs driver, 
+    // they are non-relative.
     const char *simplified_path = remove_relative(relative_path);
     for (auto mount : mounttable.get_mounts()) {
         //we know which filesystem d resides on, and where "d" is in the VFS.
@@ -252,37 +257,38 @@ int handle_openstatat(int starting_directory_id, const char *relative_path) {
 
 //Assuming we are receiving a read request for global_file_id
 //would be sent by MsgSend
-ssize_t handle_read(int global_file_id, void *buf, size_t size) {
+ssize_t handle_read(int global_file_id, void *buf, size_t size, size_t loc) {
     //Procnto will manage a global list of open files.
     //Global file id's are managed by procnto
     //local_file_id's are assigned by the filesystem.
     //procnto maintains a mapping from global_file_id -> local_file_id
     struct qnx_file *f = procnto_get_file(global_file_id);
     //TODO: I'm not distinguishing here between "read" and "read_at". It's likely we want read() to only exist within libc, and read_at() to exist everywhere else.
-    long a = MsgSend(f->driver->coid,"Please get this file data "+local_file_id,buf,size);
+    long a = MsgSend(f->driver->coid,"Please get this file data {f->local_file_id}, starting at {loc}",buf,size);
     return a;
 }
 ```
 
-##What happens inside the filesystem ResMgr?
+## What happens inside the filesystem ResMgr?
 
 * The filesystem resmgr will be structured like a normal user program. It will receive incoming FS messages from procnto, and dispatch those queries, using its exclusive access to a block device.
 * To reiterate, a filesystem ResMgr manages a block device.
 
 Q: How do FS drivers assert EXCLUSIVE access to a block device.
-A: They link to io-blk which is the only present driver on the system!
+A: They link to io-blk.
 
-Ok, so we have 2 ideas: An extent based design, or an indexed based design.
+We have 2 ideas: An extent based design, or an indexed based design.
 
-Pros of extents:
-* More space efficient in the inode, more contiguous => more speed.
-* SATA seems to allow you to request multiple contiguous blocks, so filesystems which allocate contiguously are likely to have high performance.
-* Expensive to track. Btrfs, xfs, and ext4 all use b-trees to track extents, which is probably too difficult of a design to implement here.
+Extents:
+* Pro: More space efficient in the inode, more contiguous => more speed.
+* Pro: SATA seems to allow you to request multiple contiguous blocks, so filesystems which allocate contiguously are likely to have high performance.
+* Con: Expensive to track. Btrfs, xfs, and ext4 all use b-trees to track extents, which is probably too difficult of a design to implement here.
 
-Pros of indexed files:
+Indexed files:
 * More simple to implement
 * Even small block size (512B) is likely to store >100 directory entries. So one inode with ~10-13 direct pointers is likely to store at least 1000 as wanted.
-* No fragmentation.
+* No external fragmentation.
+* Con: data is scattered all around the disk which can have speed impacts.
 
 NOTE: This code is adapted from my previous group project, PINTOS.
 * Our original design did not have an inode table, however, I have added one for more realism.
@@ -298,8 +304,6 @@ struct superblock {
   block_sector_t bitmap;
   // length of the bitmap in bytes.
   uint32_t bitmap_size;
-  // location of / on disk.
-  block_sector_t root;
   // The amount of inodes
   uint32_t num_inodes;
   // Location of inode table on disk.
@@ -318,7 +322,7 @@ struct inode_disk
 {
     //Length in "number of blocks"
     uint32_t num_blocks;
-    //TODO: Why do you need back pointers?
+    //NOTE: We might not need this back pointer. We only used it for implementing openat(".","..");
     block_sector_t parent; /* Our directory parent inode */
     block_sector_t directs[16];
     block_sector_t indirect; /* Single-level indirect */
@@ -333,7 +337,6 @@ struct inode_disk
     char wasted_space[42];
 };
 
-//NOTE: This is an in-memory format
 struct dir_entry
 {
     //inode sector is zero if dir_entry is not in use
@@ -343,6 +346,15 @@ struct dir_entry
     //max_name_len is set so that dir_entry is smaller than a block.
     char name[];
 };
+
+/*
+NOTE: This is the first design for dir entries that came to mind. There are a lot of unfortunate design tradeoffs here:
+ * If we store directory entries packed, then it's harder to delete directory entries without introducing misalignment
+ * If we store directory entries padded (char name[MAX_SIZE]) we are likely to waste a ton of space. It seems like most 
+    filesystems are ok with this tradeoff though
+ * We can also improve searching using hashing. I think you need to maintain directory entries as a tree for this to be efficient though.
+*/
+
 
 //These read and open requests come from some passed message from procnto.
 //NULL indicates "/".
@@ -356,7 +368,6 @@ struct openstatat_response handle_openstatat(struct dir *at, const char *path) {
 
 //"Local file ID" => "inum"
 //We will send this data back as a message to procnto.
-//TODO: Make procnto match this.
 ssize_t handle_read(int inum, size_t pos, void *buf, size_t size) {
     struct file *f = NULL;
     struct dir *d = NULL;
@@ -377,3 +388,7 @@ ssize_t handle_read(int inum, size_t pos, void *buf, size_t size) {
     return -1;
 }
 ```
+
+## Caching
+
+TODO:
