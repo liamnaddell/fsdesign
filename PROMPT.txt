@@ -1,0 +1,24 @@
+﻿Interview Assignment for Liam Naddell
+
+Instead of a coding assignment, this is a “how would you…” design question.  Some psuedocode or C code is fine, but the design and explanation of the solution is more important.
+
+File searches are a common use case.  Given the sizes of some file sets, increasing the speed at which directories can be searched can have noticeable benefits.
+
+Given:
+1. An application which is searching a directory tree for a single filename
+2. Individual directories within this tree may have as many as 1000 entries in them
+3. The application needs to make use of readdir().  OS-specific extensions to readdir() are permitted, including entirely-new extensions that you design
+4. The application is single-threaded. 
+5. The application will be running on QNX 8.0
+6. The filesystem providing the directory tree is a “QNX Resmgr”.
+
+
+Describe how you would implement the system to allow this application to rapidly locate the provided filename.  “The System” includes the implementation of readdir(), filesystem support code for readdir(), any caching, and even on-disk data layout.  To reduce the scope of the design, you can make and state assumptions about how certain portions of the system work.  The design should specify algorithms and data structures used, code flow of the system, any caching deemed appropriate, and rationale (including pros and cons) for the choices made.
+
+
+We will review and discuss your described design in the follow-on interview.  
+
+
+
+
+
