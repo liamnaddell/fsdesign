@@ -57,7 +57,10 @@ One nice note of our "find" implementation is that we do NOT have to call `stat`
 
 ```c
 
-//NOTE: The directory entry structure is defined by procnto. This is because we need each filesystem to report directory entry data in the exact same format, regardless of the underlying differences.
+/*NOTE: The directory entry structure is defined by procnto. 
+ * This is because we need each filesystem to report directory 
+ * entry data in the exact same format, regardless of the underlying differences.
+ */
 struct procnto_dirent {
     char d_type;
     unsigned short d_reclen; /* good idea from glibc! */
