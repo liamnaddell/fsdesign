@@ -344,15 +344,6 @@ struct dir_entry
     char name[];
 };
 
-/*
-NOTE: There are a lot of unfortunate design tradeoffs here:
- * If we store directory entries packed, then we might need to re-compact the entire directory, which could be expensive for 1000 entries.
- * If we store directory entries padded (char name[MAX_SIZE]) we are likely to waste a ton of space. It seems like some 
-    filesystems are ok with this tradeoff though
- * We can also improve searching using hashing. I think you need to maintain directory entries as a tree for this to be efficient though.
- * I picked a design which mixes the "every dir entry name is 256 bytes" approach with the "packed" approach.
-     I think this could keep sizes small while preserving the ability to add/remove entries quickly.
-*/
 
 
 //These read and open requests come from some passed message from procnto.
@@ -386,8 +377,18 @@ ssize_t handle_read(int inum, size_t pos, void *buf, size_t size) {
     }
     return -1;
 }
-NOTE: I did not include inode reading/writing code, since its not super complex, but it is very tedious. Essentially, for reading you can divide the read start location by the block size, to figure out which block to read from, then pointer-chase if needed to perform the read. For writing, you can apply the same process. What's unfortunate is that you need to handle each kind of indirection differently, which balloons the code size. Our project was even worse because of sparse inodes.
 ```
+
+For directory entries: There are a lot of unfortunate design tradeoffs here:
+ * If we store directory entries packed, then we might need to re-compact the entire directory, which could be expensive for 1000 entries.
+ * If we store directory entries padded (char name[MAX_SIZE]) we are likely to waste a ton of space. It seems like some 
+    filesystems are ok with this tradeoff though
+ * We can also improve searching using hashing. I think you need to maintain directory entries as a tree for this to be efficient though.
+ * I picked a design which mixes the "every dir entry name is 256 bytes" approach with the "packed" approach.
+     I think this could keep sizes small while preserving the ability to add/remove entries quickly.
+
+
+For inodes: I did not include inode reading/writing code, since its not super complex, but it is very tedious. Essentially, for reading you can divide the read start location by the block size, to figure out which block to read from, then pointer-chase if needed to perform the read. For writing, you can apply the same process. What's unfortunate is that you need to handle each kind of indirection differently, which balloons the code size. Our project was even worse because of sparse inodes.
 
 ## Caching and Synchronization.
 
