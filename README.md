@@ -9,16 +9,6 @@ How does this design implement a speedy `find` command:
     2. Opening directories requires a filesystem to do a brute force search of the tree it is attempting to open. If each directory contains 1000 entries, a mere 5-level-deep tree would require each open to search 1000^5 entries, which is completely unacceptable. By designing `open` to be converted to an `openat(CWD,rel_path)`, we allow a properly implemented `find` to linearly search the entire tree.
 3. The filesystem itself is based off of a design similar to the `ext2/3` filesystem series. This design is likely sufficient to implement a speedy `readdir`, as it's main performance impact is a slightly longer read time vs an extent+b-tree based design like xfs, btrfs, or ext4. Slightly longer here meaning 5-10 extra block reads from disk, assuming no caching.
 
-## TODO
-
-* Pretty pictures!
-* https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.getting_started/topic/s1_resmgr_Finding_server.html
-* File systems as shared libraries
-* Thomasf https://www.qnx.com/developers/docs/8.0/com.qnx.doc.neutrino.sys_arch/topic/resource_FILESYSresmgr.html
-* Caching
-* Synchronization.
-* Handle deleting dir entries
-
 ## Understanding the task
 
 * `find . -name <name>`
