@@ -281,15 +281,13 @@ Extents:
 
 Indexed files:
 * More simple to implement
-* Even small block size (512B) is likely to store >100 directory entries. So one inode with ~10-13 direct pointers is likely to store at least 1000 as wanted.
+* Even small block size (512B) is likely to store ~50-100 directory entries. So one inode with ~10-13 direct pointers and one indirect block is likely to store at least 1000 as wanted.
 * No external fragmentation.
 * Con: data is scattered all around the disk which can have speed impacts.
 
 NOTE: This code is adapted from my previous group project, PINTOS.
 * Our original design did not have an inode table, however, I have added one for more realism.
 * Code also used to contain sparse inodes to balence this strange design, these were removed, as inodes are no longer block sized.
-* Sparse inodes are a nightmare to program for.
-* Our original design had very easy support for openat(), since the filesystem could just grab the current user's CWD, then base relative queries from there. Microkernel cannot do this as easily because the relevant data lies across the process boundary.
 
 ```c
 struct superblock {
