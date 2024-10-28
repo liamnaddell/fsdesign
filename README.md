@@ -415,7 +415,7 @@ The challenge of FS synchronization is keeping the entire directory tree stable,
 
 ## Caching
 
-Caching is an area of FS design I feel less comfortable with, however, the design I would choose for caching would be that the cache sits as a layer between block read/write requests, and the filesystem itself. 
+The design I chose for caching would be that the cache sits as a layer between block read/write requests, and the filesystem itself. 
 * The cache acts as a hash map from block pointers to block data.
 * I would guess that you only want to cache in units of 4096 (page size) for convenience and alignment when allocating.
 * If the FS only wants 512 bytes, you load 4096 bytes into memory. Ex, a read request for block 0 would also load the data for blocks 1,2, and 3. 
@@ -430,6 +430,18 @@ Caching is an area of FS design I feel less comfortable with, however, the desig
 * flush must work correctly.
 * You need to prevent the cache from being swapped to disk.
 
-### Personal interest question:
 
-Disks also have caching now. I'm quite curious what happens when you have nested caching systems. Do nested caches constructively interfere? destructively interfere? I know CPU's have multilevel caches, and when data gets evicted from L1 cache, it moves to L2 cache, etc. With a disk, the disk has no idea what caching system the FS is using, and vice-versa. I wonder if there's a lot of cache flushes for blocks which are NEVER! going to be read/written to again, that cause cache thrashing at the disk level.
+## Extension idea to readdir to allow for faster searches.
+
+You could specify search criterion by calling a libc function, e.g.
+
+`qnx_set_readdir_critera(DIR *d,struct search_criteria *s)`
+
+* When you call readdir for the first time, these search criteria are sent to procnto.
+* procnto sends these search critera to every filesystem resmgr under `d`'s path
+* These filesystems perform the search on their own filesystem trees.
+* These filesystems forward these results back to `procnto`
+* Procnto forwards these results back to libc, who presents them as `struct dirent *de`, for consumption to find.
+* Con: This would require handling search criteria in each filesystem, which could be difficult to maintain or implement
+* You could scale this idea down by only restricting searches by file name, which might be more efficient
+* Con: A lot of file searches involve regexes, which might invalidate this strategy.
