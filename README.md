@@ -199,8 +199,10 @@ int handle_new_filesystem() {
     }
 }
 
-//NOTE: This presumes the filesystem driver is active + responding to messages at all times...
-//NOTE: This might force one driver process to handle multiple filesystems across devices, maybe not what we want.
+//NOTE: This presumes the filesystem driver is active + responding to messages at all times. 
+//        The FS driver can fork() to handle individual filesystems
+//Another design would involve a block driver process linking to a filesystem, and responding 
+//to mount requests by querying each shared object. 
 int handle_mount_request(device d, const char *loc) {
     bool found_device_driver = false;
 
