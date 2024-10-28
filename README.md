@@ -275,7 +275,7 @@ A: They link to io-blk.
 We have 2 ideas: An extent based design, or an indexed based design.
 
 Extents:
-* Pro: More space efficient in the inode, more contiguous => more speed.
+* Pro: Ideally more space efficient in the inode, more contiguous => more speed.
 * Pro: SATA seems to allow you to request multiple contiguous blocks, so filesystems which allocate contiguously are likely to have high performance.
 * Con: Expensive to track. Btrfs, xfs, and ext4 all use b-trees to track extents, which is probably too difficult of a design to implement here.
 
@@ -291,7 +291,6 @@ NOTE: This code is adapted from my previous group project, PINTOS.
 
 ```c
 struct superblock {
-  // 0xdeadbeef
   uint32_t magic;
   // location of free map on disk
   block_sector_t bitmap;
@@ -334,18 +333,25 @@ struct dir_entry
 {
     //inode sector is zero if dir_entry is not in use
     block_sector_t inode_sector; /* Sector number of header. */
-    //dir entry file names are stored as packed as possible on disk
-    //name is null terminated, and cannot be greater than MAX_NAME_LEN
-    //max_name_len is set so that dir_entry is smaller than a block.
+    //len 1 = 8 bytes
+    //len 2 = 16 bytes
+    //len 3 = 32 bytes
+    //len 4 = 64 bytes
+    //len 5 = 128 bytes
+    //len 6 = 256 bytes
+    uint8_t len;
+    //name is padded with null pointers to match one of these sizes.
     char name[];
 };
 
 /*
-NOTE: This is the first design for dir entries that came to mind. There are a lot of unfortunate design tradeoffs here:
- * If we store directory entries packed, then it's harder to delete directory entries without introducing misalignment
- * If we store directory entries padded (char name[MAX_SIZE]) we are likely to waste a ton of space. It seems like most 
+NOTE: There are a lot of unfortunate design tradeoffs here:
+ * If we store directory entries packed, then we might need to re-compact the entire directory, which could be expensive for 1000 entries.
+ * If we store directory entries padded (char name[MAX_SIZE]) we are likely to waste a ton of space. It seems like some 
     filesystems are ok with this tradeoff though
  * We can also improve searching using hashing. I think you need to maintain directory entries as a tree for this to be efficient though.
+ * I picked a design which mixes the "every dir entry name is 256 bytes" approach with the "packed" approach.
+     I think this could keep sizes small while preserving the ability to add/remove entries quickly.
 */
 
 
